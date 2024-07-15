@@ -44,6 +44,7 @@ pub struct LanguageData {
     textobject_query: OnceCell<Option<TextObjectQuery>>,
     tag_query: OnceCell<Option<TagQuery>>,
     rainbow_query: OnceCell<Option<RainbowQuery>>,
+    context_query: OnceCell<Option<ContextQuery>>,
 }
 
 impl LanguageData {
@@ -959,6 +960,11 @@ impl OverlayHighlighter {
                 .skip(start),
         )
     }
+}
+
+#[derive(Debug)]
+pub struct ContextQuery {
+    pub query: Query,
 }
 
 #[derive(Debug)]
