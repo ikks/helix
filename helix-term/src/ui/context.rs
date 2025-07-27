@@ -2,10 +2,10 @@
 use helix_core::visual_coords_at_pos;
 
 use helix_core::{
-    syntax::RopeProvider,
+    syntax,
     text_annotations::TextAnnotations,
-    tree_sitter::{Node, QueryCursor, QueryMatch},
-    Position,
+    tree_sitter::{InactiveQueryCursor, Node},
+    visual_offset_from_anchor, Position,
 };
 
 use helix_view::{editor::Config, graphics::Rect, Document, DocumentId, Theme, View};
@@ -23,7 +23,7 @@ use super::{
 pub struct StickyNode {
     pub line: usize,
     pub visual_line: u16,
-    pub byte_range: std::ops::Range<usize>,
+    pub byte_range: std::ops::Range<u32>,
     pub indicator: Option<String>,
     pub anchor: usize,
     pub has_context_end: bool,
@@ -37,9 +37,9 @@ struct StickyNodeContext {
     /// This marks the location of which we take possible out of range nodes
     /// e.g. on follows-cursor: 'on', this would be the parent nodes, relative to the *cursor*
     /// on follows-cursor: 'off', this would be the parent nodes, relative to the *topmost screen*
-    pub context_location: usize,
+    pub context_location: u32,
     /// The topmost byte that is visible (and not hidden behind sticky nodes)
-    pub topmost_byte: usize,
+    pub topmost_byte: u32,
     /// The anchor of the view offset
     pub anchor_line: usize,
     /// The viewport
@@ -77,14 +77,27 @@ impl StickyNodeContext {
         } else {
             top_first_byte
         };
+
         Some(Self {
             visual_row: visual_cursor_row,
-            context_location: last_scan_byte,
-            topmost_byte: top_first_byte,
+            context_location: last_scan_byte as u32,
+            topmost_byte: top_first_byte as u32,
             anchor_line,
             viewport,
         })
     }
+}
+
+fn node_in_range(
+    node: &Node,
+    anchor: usize,
+    line: usize,
+    last_scan_byte: u32,
+    topmost_byte: u32,
+    result_len: usize,
+) -> bool {
+    (!node.byte_range().contains(&last_scan_byte) || !node.byte_range().contains(&topmost_byte))
+        && line != anchor + result_len
 }
 
 /// Calculates the sticky nodes
@@ -93,6 +106,7 @@ pub fn calculate_sticky_nodes(
     doc: &Document,
     view: &View,
     config: &Config,
+    loader: &syntax::Loader,
     cursor_cache: Option<&Position>,
 ) -> Option<Vec<StickyNode>> {
     let Some(mut context) =
@@ -104,6 +118,7 @@ pub fn calculate_sticky_nodes(
     let syntax = doc.syntax()?;
     let tree = syntax.tree();
     let text = doc.text().slice(..);
+    let root_node = tree.root_node();
 
     let mut cached_nodes = build_cached_nodes(doc, nodes, view, &mut context).unwrap_or_default();
 
@@ -129,7 +144,7 @@ pub fn calculate_sticky_nodes(
         .descendant_for_byte_range(start_byte, start_byte);
 
     // When the start_node is the root node... there's no point in searching further
-    if let Some(start_node) = start_node {
+    if let Some(ref start_node) = start_node {
         if start_node.byte_range() == tree.root_node().byte_range() {
             return None;
         }
@@ -137,85 +152,105 @@ pub fn calculate_sticky_nodes(
 
     // Traverse to the parent node
     while start_node
-        .unwrap_or_else(|| tree.root_node())
+        .as_ref()
+        .unwrap_or_else(|| &root_node)
         .parent()
         .unwrap_or_else(|| tree.root_node())
         .byte_range()
         != tree.root_node().byte_range()
     {
-        let Some(start) = start_node else {
+        let Some(start) = &start_node else {
             continue;
         };
 
         start_node = start.parent();
     }
 
-    let context_nodes = doc
-        .language_config()
-        .and_then(|lang| lang.context_query())?;
+    let Some(syntax) = doc.syntax() else {
+        return None;
+    };
 
-    let start_index = context_nodes.query.capture_index_for_name("context")?;
-    let end_index = context_nodes
-        .query
-        .capture_index_for_name("context.params")
-        .unwrap_or(start_index);
+    let Some(context_query) = loader.context_query(syntax.root_language()) else {
+        return None;
+    };
 
-    let mut cursor = QueryCursor::new();
-    cursor.set_byte_range(start_byte_range.start..context.context_location);
+    let Some(context_capture) = context_query.context_capture else {
+        return None;
+    };
 
-    let query = &context_nodes.query;
+    let param_capture = context_query.param_capture;
+
+    let cursor =
+        InactiveQueryCursor::new(start_byte_range.start..context.context_location, u32::MAX);
+
     // Collect the query, for further iteration
-    let query_matches = cursor.matches(
-        query,
-        start_node.unwrap_or_else(|| tree.root_node()),
-        RopeProvider(text),
+    let mut query_matches = cursor.execute_query(
+        &context_query.query,
+        start_node.as_ref().unwrap_or(&root_node),
+        text,
     );
 
-    for matched_node in query_matches {
-        // find @context.params nodes
-        let node_byte_range = get_context_paired_range(
-            &matched_node,
-            start_index,
-            end_index,
-            context.topmost_byte,
+    let Some(query_matched) = query_matches.next_match() else {
+        return None;
+    };
+
+    let context_nodes = query_matched.nodes_for_capture(context_capture);
+    let mut param_nodes = param_capture.map(|param_cap| query_matched.nodes_for_capture(param_cap));
+
+    for node in context_nodes {
+        let mut last_node_add = 0 as u32;
+        let context_range = node.byte_range();
+        let first_byte = context_range.start + 1;
+        let first_byte_as_line = text.byte_to_line(first_byte as usize);
+        let end_context_start = first_byte;
+
+        if let Some(last_node) = result.last() {
+            if last_node.line == first_byte_as_line {
+                last_node_add += text
+                    .line(text.byte_to_line(context.topmost_byte as usize))
+                    .len_bytes() as u32;
+            }
+        }
+
+        if node_in_range(
+            node,
+            context.anchor_line,
+            first_byte_as_line,
             context.context_location,
+            context.topmost_byte + last_node_add,
+            result.len(),
+        ) {
+            continue;
+        }
+
+        let end_byte = param_nodes
+            .as_mut()
+            .map(|param_nodes| {
+                param_nodes
+                    .peekable()
+                    .next_if(|n| context_range.contains(&n.end_byte()))
+                    .map(|n| n.end_byte())
+                    .unwrap_or(end_context_start)
+            })
+            .unwrap_or(end_context_start);
+
+        log::error!(
+            "|end_context_start: {end_context_start}| {first_byte}..{end_byte}: {:?}",
+            text.get_byte_slice(first_byte as usize..end_byte as usize)
+                .map(|s| s.as_str())
         );
 
-        for node in matched_node.nodes_for_capture_index(start_index) {
-            let mut last_node_add = 0;
-            if let Some(last_node) = result.last() {
-                if last_node.line == (node.start_position().row) {
-                    last_node_add += text
-                        .line(text.byte_to_line(context.topmost_byte))
-                        .len_bytes();
-                }
-            }
-
-            if node_in_range(
-                node,
-                context.anchor_line,
-                node_byte_range.as_ref(),
-                context.context_location,
-                context.topmost_byte + last_node_add,
-                result.len(),
-            ) {
-                continue;
-            }
-
-            result.push(StickyNode {
-                line: node.start_position().row,
-                visual_line: 0,
-                byte_range: node_byte_range
-                    .as_ref()
-                    .unwrap_or(&(node.start_byte()..node.end_byte()))
-                    .clone(),
-                indicator: None,
-                anchor: doc.view_offset(view.id).anchor,
-                has_context_end: node_byte_range.is_some(),
-                doc_id: view.doc,
-            });
-        }
+        result.push(StickyNode {
+            line: text.byte_to_line(first_byte as usize),
+            visual_line: 0,
+            byte_range: (first_byte..end_byte),
+            indicator: None,
+            anchor: doc.view_offset(view.id).anchor,
+            has_context_end: end_context_start != end_byte,
+            doc_id: view.doc,
+        })
     }
+
     // result should be filled by now
     if result.is_empty() {
         if !cached_nodes.is_empty() {
@@ -299,58 +334,6 @@ fn build_cached_nodes(
     None
 }
 
-fn get_context_paired_range(
-    query_match: &QueryMatch,
-    start_index: u32,
-    end_index: u32,
-    top_first_byte: usize,
-    last_scan_byte: usize,
-) -> Option<std::ops::Range<usize>> {
-    // get all the captured @context.params nodes
-    let end_nodes = once_cell::unsync::Lazy::new(|| {
-        query_match
-            .nodes_for_capture_index(end_index)
-            .collect::<Vec<_>>()
-    });
-
-    query_match
-        .nodes_for_capture_index(start_index)
-        .find_map(|context| {
-            let ctx_start_range = context.byte_range();
-
-            // filter all matches that are out of scope, based on follows-cursor
-            let start_range_contains_bytes = ctx_start_range.contains(&top_first_byte)
-                && ctx_start_range.contains(&last_scan_byte);
-            if !start_range_contains_bytes {
-                return None;
-            }
-
-            let ctx_start_row = context.start_position().row;
-            let ctx_start_byte = ctx_start_range.start;
-
-            end_nodes.iter().find_map(|it| {
-                let end = it.end_byte();
-                // check whether or not @context.params nodes are on different lines
-                (ctx_start_row != it.end_position().row && ctx_start_range.contains(&end))
-                    .then_some(ctx_start_byte..end)
-            })
-        })
-}
-
-/// Tests whether or not a given node is in a specific tree-sitter range
-fn node_in_range(
-    node: Node,
-    anchor: usize,
-    node_byte_range: Option<&std::ops::Range<usize>>,
-    last_scan_byte: usize,
-    topmost_byte: usize,
-    result_len: usize,
-) -> bool {
-    (!node.byte_range().contains(&last_scan_byte) || !node.byte_range().contains(&topmost_byte))
-        && node.start_position().row != anchor + result_len
-        && node_byte_range.is_none()
-}
-
 /// Adds an indicator line to the Sticky Context
 fn add_indicator(
     doc: &Document,
@@ -380,6 +363,7 @@ pub fn render_sticky_context(
     surface: &mut Surface,
     context: Option<&Vec<StickyNode>>,
     theme: &Theme,
+    loader: &syntax::Loader,
 ) {
     let Some(context) = context else {
         return;
@@ -421,7 +405,7 @@ pub fn render_sticky_context(
             continue;
         }
 
-        let node_start = text.byte_to_char(node.byte_range.start);
+        let node_start = text.byte_to_char(node.byte_range.start as usize);
         let first_node_line = text.line(text.char_to_line(node_start));
 
         // subtract 1 to handle indexes
@@ -441,8 +425,9 @@ pub fn render_sticky_context(
         } = visual_coords_at_pos(first_node_line, first_node_line_end, doc.tab_width());
 
         // get the highlighting of the basic capture
-        let syntax_highlights = EditorView::doc_syntax_highlights(doc, node_start, 1, theme);
-        let overlay_highlights = EditorView::empty_highlight_iter(doc, node_start, 1);
+        let syntax_highlights = EditorView::doc_syntax_highlighter(doc, node_start, 1, loader);
+        let overlay_highlights =
+            EditorView::overlay_syntax_highlights(doc, node_start, 1, &Default::default());
 
         let mut offset_area = context_area;
 
@@ -462,7 +447,7 @@ pub fn render_sticky_context(
                 &formatting,
                 &TextAnnotations::default(),
                 syntax_highlights,
-                overlay_highlights,
+                vec![overlay_highlights],
                 theme,
                 DecorationManager::default(),
             );
@@ -470,13 +455,14 @@ pub fn render_sticky_context(
         }
 
         if node.has_context_end {
-            let node_end = text.byte_to_char(node.byte_range.end);
+            let node_end = text.byte_to_char(node.byte_range.end as usize);
             let end_node_line = text.line(text.char_to_line(node_end));
             let whitespace_offset = end_node_line
                 .chars()
                 .position(|c| !c.is_whitespace())
                 .unwrap_or(0);
 
+            // TODO: use visual_offset_from_anchor
             #[allow(deprecated)]
             let Position {
                 col: end_vis_offset,
@@ -500,8 +486,9 @@ pub fn render_sticky_context(
                 offset_area,
             );
 
-            let syntax_highlights = EditorView::doc_syntax_highlights(doc, node_end, 1, theme);
-            let overlay_highlights = EditorView::empty_highlight_iter(doc, node_end, 1);
+            let syntax_highlights = EditorView::doc_syntax_highlighter(doc, node_end, 1, loader);
+            let overlay_highlights =
+                EditorView::overlay_syntax_highlights(doc, node_end, 1, &Default::default());
 
             let mut formatting = doc.text_format(offset_area.width, Some(theme));
             formatting.soft_wrap = false;
@@ -513,7 +500,7 @@ pub fn render_sticky_context(
                 &formatting,
                 &TextAnnotations::default(),
                 syntax_highlights,
-                overlay_highlights,
+                vec![overlay_highlights],
                 theme,
                 DecorationManager::default(),
             );

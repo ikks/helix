@@ -162,19 +162,6 @@ impl EditorView {
             }
         }
 
-        let gutter_overflow = view.gutter_offset(doc) == 0;
-        if !gutter_overflow {
-            Self::render_gutter(
-                editor,
-                doc,
-                view,
-                view.area,
-                theme,
-                is_focused & self.terminal_focused,
-                &mut decorations,
-            );
-        }
-
         Self::render_rulers(editor, doc, view, inner, surface, theme);
 
         let primary_cursor = doc
@@ -235,13 +222,19 @@ impl EditorView {
                 doc,
                 view,
                 &config,
+                &loader,
                 editor.cursor_cache.get(view, doc).as_ref(),
             );
 
-            context::render_sticky_context(doc, view, surface, self.sticky_nodes.as_ref(), theme);
+            context::render_sticky_context(
+                doc,
+                view,
+                surface,
+                self.sticky_nodes.as_ref(),
+                theme,
+                &loader,
+            );
         }
-
-        Self::render_rulers(editor, doc, view, inner, surface, theme);
 
         // if we're not at the edge of the screen, draw a right border
         if viewport.right() != view.area.right() {

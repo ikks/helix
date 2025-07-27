@@ -56,6 +56,7 @@ impl LanguageData {
             textobject_query: OnceCell::new(),
             tag_query: OnceCell::new(),
             rainbow_query: OnceCell::new(),
+            context_query: OnceCell::new(),
         }
     }
 
@@ -223,6 +224,36 @@ impl LanguageData {
             .get_or_init(|| {
                 let grammar = self.syntax_config(loader)?.grammar;
                 Self::compile_rainbow_query(grammar, &self.config)
+                    .map_err(|err| {
+                        log::error!("{err}");
+                    })
+                    .ok()
+                    .flatten()
+            })
+            .as_ref()
+    }
+
+    /// Compiles the context.scm query for a language.
+    /// This function should only be used by this module or the xtask crate.
+    pub fn compile_context_query(
+        grammar: Grammar,
+        config: &LanguageConfiguration,
+    ) -> Result<Option<ContextQuery>> {
+        let name = &config.language_id;
+        let text = read_query(name, "context.scm");
+        if text.is_empty() {
+            return Ok(None);
+        }
+        let rainbow_query = ContextQuery::new(grammar, &text)
+            .with_context(|| format!("Failed to compile context.scm query for '{name}'"))?;
+        Ok(Some(rainbow_query))
+    }
+
+    fn context_query(&self, loader: &Loader) -> Option<&ContextQuery> {
+        self.context_query
+            .get_or_init(|| {
+                let grammar = self.syntax_config(loader)?.grammar;
+                Self::compile_context_query(grammar, &self.config)
                     .map_err(|err| {
                         log::error!("{err}");
                     })
@@ -423,6 +454,10 @@ impl Loader {
 
     fn rainbow_query(&self, lang: Language) -> Option<&RainbowQuery> {
         self.language(lang).rainbow_query(self)
+    }
+
+    pub fn context_query(&self, lang: Language) -> Option<&ContextQuery> {
+        self.language(lang).context_query(self)
     }
 
     pub fn language_server_configs(&self) -> &HashMap<String, LanguageServerConfiguration> {
@@ -965,6 +1000,20 @@ impl OverlayHighlighter {
 #[derive(Debug)]
 pub struct ContextQuery {
     pub query: Query,
+    pub context_capture: Option<Capture>,
+    pub param_capture: Option<Capture>,
+}
+
+impl ContextQuery {
+    fn new(grammar: Grammar, source: &str) -> Result<Self, tree_sitter::query::ParseError> {
+        let query = Query::new(grammar, source, |_, _| Ok(()))?;
+
+        Ok(Self {
+            context_capture: query.get_capture("context"),
+            param_capture: query.get_capture("context.param"),
+            query,
+        })
+    }
 }
 
 #[derive(Debug)]
