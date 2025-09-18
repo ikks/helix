@@ -20,6 +20,7 @@
 - [`[editor.smart-tab]` Section](#editorsmart-tab-section)
 - [`[editor.inline-diagnostics]` Section](#editorinline-diagnostics-section)
 - [`[editor.word-completion]` Section](#editorword-completion-section)
+- [`[editor.sticky-context]` Section](#editorsticky-context-section)
 
 ### `[editor]` Section
 
@@ -488,4 +489,24 @@ Example:
 enable = true
 # Set the trigger length lower so that words are completed more often
 trigger-length = 4
+```
+
+### `[editor.sticky-context]` Section
+
+Option for sticky context, which is a feature that puts bigger blocks of code
+e.g. Functions to the top of the viewport
+
+| Key         | Description                                                                                | Default |
+| ---         | ---                                                                                        | ---     |
+| `enable`    | Display context of current line if outside the view                                        | `false` |
+| `indicator` | Display an additional line to indicate what part of the view is the sticky context         | `false` |
+| `max-lines` | The maximum number of lines to be shown as sticky context. 0 = 1/3 of the viewports height | `0`     |
+
+Example:
+
+```toml
+[editor.sticky-context]
+enable = true
+indicator = true
+max-lines = 10
 ```
